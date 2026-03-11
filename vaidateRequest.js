@@ -1,93 +1,88 @@
-const Joi = require("joi");
+const { BaseService } = require("./BaseService");
+const { Prisma } = require("@prisma/client");
 
-/**
- * @description Returns schema to validate POST model change dates request
- * @returns {Object} Joi schema
- */
-function getValidationSchema() {
-  return Joi.object({
-    scenarioId: Joi.string().trim().uuid().required().messages({
-      "any.required": "ValidationError: scenarioId is required and must be a uuid.",
-      "string.base": "ValidationError: scenarioId is required and must be a uuid.",
-      "string.empty": "ValidationError: scenarioId is required and must be a uuid.",
-      "string.guid": "ValidationError: scenarioId is required and must be a uuid.",
-    }),
+class modelChangeDatesData extends BaseService {
+  constructor(db) {
+    super(db);
+  }
 
-    userEmail: Joi.string().trim().email().required().messages({
-      "any.required": "ValidationError: userEmail is required and must be a string.",
-      "string.base": "ValidationError: userEmail is required and must be a string.",
-      "string.empty": "ValidationError: userEmail is required and must be a string.",
-      "string.email": "ValidationError: Invalid userEmail.",
-    }),
+  /**
+   * @description Function to fetch model change dates by scenarioId
+   */
+  async getModelChangeDatesByScenarioId(scenarioId) {
+    try {
+      return await this.prisma.$queryRaw`
+        select
+          sub_series_description as "subSeries",
+          model_year as "modelYear",
+          model_year_start_date as "startProdDate",
+          model_year_end_date as "endProdDate"
+        from supply_planning.model_change_date
+        where scenario_id = ${scenarioId}::uuid and is_active = true
+        order by sub_series_description, model_year;
+      `;
+    } catch (err) {
+      console.log("Error in getModelChangeDatesByScenarioId:", err);
+      throw err;
+    }
+  }
 
-    data: Joi.array()
-      .min(1)
-      .required()
-      .items(
-        Joi.object({
-          modelYear: Joi.string()
-            .trim()
-            .pattern(/^MY\s?\d{2}$/)
-            .required()
-            .messages({
-              "any.required":
-                "ValidationError: modelYear is required and must be a string in the format MY YY.",
-              "string.base":
-                "ValidationError: modelYear is required and must be a string in the format MY YY.",
-              "string.empty":
-                "ValidationError: modelYear is required and must be a string in the format MY YY.",
-              "string.pattern.base":
-                "ValidationError: modelYear is required and must be a string in the format MY YY.",
-            }),
-
-          subSeries: Joi.string().trim().required().messages({
-            "any.required": "ValidationError: subSeries is required and must be a string.",
-            "string.base": "ValidationError: subSeries is required and must be a string.",
-            "string.empty": "ValidationError: subSeries is required and must be a string.",
-          }),
-
-          startProdDate: Joi.string()
-            .trim()
-            .pattern(/^\d{4}-\d{2}-\d{2}$/)
-            .required()
-            .messages({
-              "any.required":
-                "ValidationError: startProdDate is required and must be a string in the format YYYY-MM-DD.",
-              "string.base":
-                "ValidationError: startProdDate is required and must be a string in the format YYYY-MM-DD.",
-              "string.empty":
-                "ValidationError: startProdDate is required and must be a string in the format YYYY-MM-DD.",
-              "string.pattern.base":
-                "ValidationError: startProdDate is required and must be a string in the format YYYY-MM-DD.",
-            }),
-
-          endProdDate: Joi.string()
-            .trim()
-            .pattern(/^\d{4}-\d{2}-\d{2}$/)
-            .required()
-            .messages({
-              "any.required":
-                "ValidationError: endProdDate is required and must be a string in the format YYYY-MM-DD.",
-              "string.base":
-                "ValidationError: endProdDate is required and must be a string in the format YYYY-MM-DD.",
-              "string.empty":
-                "ValidationError: endProdDate is required and must be a string in the format YYYY-MM-DD.",
-              "string.pattern.base":
-                "ValidationError: endProdDate is required and must be a string in the format YYYY-MM-DD.",
-            }),
-        })
-      )
-      .messages({
-        "any.required":
-          "ValidationError: data is required and must be an array with atleast 1 item.",
-        "array.base":
-          "ValidationError: data is required and must be an array with atleast 1 item.",
-        "array.min":
-          "ValidationError: data is required and must be an array with atleast 1 item.",
-      }),
-  });
+  /**
+   * @description Function to upsert model change dates for a scenario
+   * @param {String} scenarioId - scenario id
+   * @param {String} userEmail - user email
+   * @param {Array} input - [{ modelYear, subSeries, startProdDate, endProdDate }]
+   */
+  async upsertModelChangeDates(scenarioId, userEmail, input) {
+    try {
+      return await this.prisma.$executeRaw`
+        INSERT INTO supply_planning.model_change_date (
+          scenario_id,
+          model_year,
+          sub_series_description,
+          model_year_start_date,
+          model_year_end_date,
+          created_by,
+          updated_by,
+          last_updated,
+          is_active
+        )
+        SELECT
+          ${scenarioId}::uuid AS scenario_id,
+          v.model_year,
+          v.sub_series_description,
+          v.model_year_start_date,
+          v.model_year_end_date,
+          ${userEmail}::text AS created_by,
+          ${userEmail}::text AS updated_by,
+          NOW() AS last_updated,
+          true AS is_active
+        FROM (
+          VALUES
+          ${Prisma.join(
+            input.map(
+              (item) => Prisma.sql`(
+                ${item.modelYear}::text,
+                ${item.subSeries}::text,
+                ${item.startProdDate}::date,
+                ${item.endProdDate}::date
+              )`
+            )
+          )}
+        ) AS v(model_year, sub_series_description, model_year_start_date, model_year_end_date)
+        ON CONFLICT (scenario_id, model_year, sub_series_description)
+        DO UPDATE SET
+          model_year_start_date = EXCLUDED.model_year_start_date,
+          model_year_end_date = EXCLUDED.model_year_end_date,
+          updated_by = ${userEmail}::text,
+          last_updated = NOW(),
+          is_active = true
+      `;
+    } catch (err) {
+      console.log("Error in upsertModelChangeDates:", err);
+      throw err;
+    }
+  }
 }
 
-module.exports = {
-  getValidationSchema,
-};
+module.exports.modelChangeDatesData = modelChangeDatesData;
