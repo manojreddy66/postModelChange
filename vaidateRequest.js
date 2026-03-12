@@ -1,467 +1,232 @@
-it("Unit Test Case 3: The API should return validation error with a 400 status code when accessed with an empty event.", async () => {
-  console.log(
-    "*****************Unit Test Case 3: The API should return validation error with a 400 status code when accessed with an empty event.*****************"
-  );
+/**
+ * @description this file contains request validation methods
+ */
 
-  const event = {};
-  const result = await lambda.handler(event);
+const { dbConnect } = require("prismaORM/index");
+const { scenariosData } = require("prismaORM/services/scenariosService");
+const {
+  modelChangeDatesData,
+} = require("prismaORM/services/modelChangeDateService");
+const {
+  getValidationSchema,
+} = require("schemaValidator/supplyPlanning/modelChangeDates/postModelChangeDatesSchema");
 
-  assert.equal(result.statusCode, 400);
+/**
+ * @description Function to validate input request body
+ * @param {Object} body: API input request body
+ * @returns {Array} errorMessages - Validation errors if any
+ */
+async function validateInput(body) {
+  const errorMessages = [];
 
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: scenarioId is required and must be a uuid.",
-      "ValidationError: userEmail is required and must be a string.",
-      "ValidationError: data is required and must be an array with atleast 1 item.",
-    ],
+  /**
+   * @description Validate request body using Joi schema
+   */
+  validateParams(body, errorMessages);
+
+  /**
+   * @description If Joi validation passed, perform DB and business validations
+   */
+  if (errorMessages.length === 0) {
+    const rdb = await dbConnect();
+
+    /**
+     * @description Validate scenario exists
+     */
+    const scenariosService = new scenariosData(rdb);
+    const scenarioData = await scenariosService.getScenarioDataById(body.scenarioId);
+
+    if (!scenarioData || scenarioData.length === 0) {
+      errorMessages.push("ValidationError: Scenario doesn't exist.");
+      return errorMessages;
+    }
+
+    const scenarioRow = scenarioData[0];
+
+    /**
+     * @description Fetch existing model change dates data by scenarioId
+     */
+    const modelChangeService = new modelChangeDatesData(rdb);
+    const existingRows =
+      await modelChangeService.getModelChangeDatesByScenarioId(body.scenarioId);
+
+    /**
+     * @description Validate business rules on final dataset (existing + incoming)
+     */
+    validateModelChangeDates(scenarioRow, existingRows, body.data, errorMessages);
+  }
+
+  return [...new Set(errorMessages)];
+}
+
+/**
+ * @description Function to validate request params using Joi schema
+ * @param {Object} body - request body
+ * @param {Array} errorMessages - array to collect validation errors
+ */
+function validateParams(body, errorMessages) {
+  const schema = getValidationSchema();
+  const { error } = schema.validate(body, { abortEarly: false });
+
+  if (error?.details?.length) {
+    error.details.forEach((e) => errorMessages.push(e.message));
+  }
+}
+
+/**
+ * @description Function to validate model change date business rules (doc point vi)
+ * This validates on the final view of data: DB rows + incoming rows (incoming overrides)
+ *
+ * @param {Object} scenarioRow - scenario data row from DB
+ * @param {Array} existingRows - model_change_date rows from DB
+ * @param {Array} inputRows - request body data rows
+ * @param {Array} errorMessages - collector to push validation errors
+ */
+function validateModelChangeDates(
+  scenarioRow,
+  existingRows,
+  inputRows,
+  errorMessages
+) {
+  /**
+   * @description Merge DB + incoming so we validate the final expected state
+   */
+  const finalRows = mergeModelChangeRows(existingRows, inputRows);
+
+  /**
+   * @description Group rows by subSeries for validation
+   */
+  const groupedData = {};
+  finalRows.forEach((record) => {
+    const subSeries = record.subSeries;
+    if (!groupedData[subSeries]) groupedData[subSeries] = [];
+    groupedData[subSeries].push(record);
   });
-});
 
-it("Unit Test Case 4: The API should return a validation error (400) - scenarioId is missing.", async () => {
-  console.log(
-    "*****************Unit Test Case 4: The API should return a validation error with a 400 status code - scenarioId is missing.*****************"
-  );
+  /**
+   * @description Scenario timeframe for month-level validation (YYYYMM)
+   */
+  const scenarioStartYM = scenarioRow.start_month_year; // YYYYMM
+  const scenarioEndYM = scenarioRow.end_month_year; // YYYYMM
 
-  const event = {
-    body: JSON.stringify({
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
+  /**
+   * @description Validate each subSeries separately
+   */
+  for (const subSeries in groupedData) {
+    const records = groupedData[subSeries];
 
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
+    /**
+     * @description Sort records by modelYear (MY 25, MY 26...) to validate sequential rules
+     */
+    records.sort((a, b) => parseMY(a.modelYear) - parseMY(b.modelYear));
 
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: ["ValidationError: scenarioId is required and must be a uuid."],
+    /**
+     * @description Rule 1 & 2: Start date must be earlier than end date (per MY, per subseries)
+     */
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i];
+      const start = toUTCDate(record.startProdDate);
+      const end = toUTCDate(record.endProdDate);
+
+      if (!(start < end)) {
+        errorMessages.push(
+          `ValidationError: For subseries ${subSeries}, model year ${record.modelYear}: startProdDate must be earlier than endProdDate.`
+        );
+        errorMessages.push(
+          `ValidationError: For subseries ${subSeries}, model year ${record.modelYear}: endProdDate must be later than startProdDate.`
+        );
+      }
+
+      /**
+       * @description Rule 3: Next MY start must be exactly +1 day from previous MY end (same subseries)
+       */
+      if (i > 0) {
+        const prev = records[i - 1];
+        const prevEnd = toUTCDate(prev.endProdDate);
+        const expectedStart = addDaysUTC(prevEnd, 1);
+        const currentStart = start;
+
+        if (currentStart.getTime() !== expectedStart.getTime()) {
+          errorMessages.push(
+            `ValidationError: For subseries ${subSeries}, model year ${record.modelYear}: startProdDate must be one day after previous model year endProdDate.`
+          );
+        }
+      }
+    }
+
+    /**
+     * @description Rule 4: Month-level coverage for scenario timeframe
+     * - First MY start month <= scenario start month
+     * - Last MY end month >= scenario end month
+     */
+    if (records.length > 0) {
+      const firstStartYM = toYYYYMM(records[0].startProdDate);
+      const lastEndYM = toYYYYMM(records[records.length - 1].endProdDate);
+
+      if (scenarioStartYM && firstStartYM > scenarioStartYM) {
+        errorMessages.push(
+          `ValidationError: For subseries ${subSeries}: First model year start must be same or earlier than scenario start.`
+        );
+      }
+
+      if (scenarioEndYM && lastEndYM < scenarioEndYM) {
+        errorMessages.push(
+          `ValidationError: For subseries ${subSeries}: Last model year start must be same or later than scenario end.`
+        );
+      }
+    }
+  }
+}
+
+/**
+ * @description Merge existing DB rows and incoming request rows
+ * Incoming rows override DB rows for the same (subSeries + modelYear)
+ */
+function mergeModelChangeRows(existingRows, inputRows) {
+  const map = new Map();
+
+  existingRows.forEach((r) => {
+    map.set(`${r.subSeries}__${r.modelYear}`, r);
   });
-});
 
-it("Unit Test Case 5: The API should return a validation error (400) - invalid scenarioId.", async () => {
-  console.log(
-    "*****************Unit Test Case 5: The API should return a validation error with a 400 status code - invalid scenarioId.*****************"
-  );
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "invalid_uuid",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: ["ValidationError: scenarioId is required and must be a uuid."],
+  inputRows.forEach((r) => {
+    map.set(`${r.subSeries}__${r.modelYear}`, r);
   });
-});
 
-it("Unit Test Case 6: The API should return a validation error (400) - userEmail is missing.", async () => {
-  console.log(
-    "*****************Unit Test Case 6: The API should return a validation error with a 400 status code - userEmail is missing.*****************"
-  );
+  return Array.from(map.values());
+}
 
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
+/**
+ * @description Helper: parse "MY 25" / "MY25" -> 25
+ */
+function parseMY(modelYear) {
+  return parseInt(String(modelYear).match(/(\d{2})$/)[1], 10);
+}
 
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
+/**
+ * @description Helper: create UTC date from "YYYY-MM-DD"
+ */
+function toUTCDate(dateStr) {
+  const [y, m, d] = String(dateStr).split("-").map((x) => parseInt(x, 10));
+  return new Date(Date.UTC(y, m - 1, d));
+}
 
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: ["ValidationError: userEmail is required and must be a string."],
-  });
-});
+/**
+ * @description Helper: add days in UTC
+ */
+function addDaysUTC(dateObj, days) {
+  const dt = new Date(dateObj.getTime());
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt;
+}
 
-it("Unit Test Case 7: The API should return a validation error (400) - invalid userEmail.", async () => {
-  console.log(
-    "*****************Unit Test Case 7: The API should return a validation error with a 400 status code - invalid userEmail.*****************"
-  );
+/**
+ * @description Helper: convert "YYYY-MM-DD" to "YYYYMM"
+ */
+function toYYYYMM(dateStr) {
+  return String(dateStr).slice(0, 7).replace("-", "");
+}
 
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "not-an-email",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: ["ValidationError: Invalid userEmail."],
-  });
-});
-it("Unit Test Case 8: The API should return a validation error (400) - data is missing.", async () => {
-  console.log(
-    "*****************Unit Test Case 8: The API should return a validation error with a 400 status code - data is missing.*****************"
-  );
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: data is required and must be an array with atleast 1 item.",
-    ],
-  });
-});
-
-it("Unit Test Case 9: The API should return a validation error (400) - data is empty array.", async () => {
-  console.log(
-    "*****************Unit Test Case 9: The API should return a validation error with a 400 status code - data is empty array.*****************"
-  );
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: data is required and must be an array with atleast 1 item.",
-    ],
-  });
-});
-
-it("Unit Test Case 10: The API should return a validation error (400) - invalid modelYear.", async () => {
-  console.log(
-    "*****************Unit Test Case 10: The API should return a validation error with a 400 status code - invalid modelYear.*****************"
-  );
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: modelYear is required and must be a string in the format MY YY.",
-    ],
-  });
-});
-it("Unit Test Case 11: The API should return a validation error (400) - subSeries is missing.", async () => {
-  console.log(
-    "*****************Unit Test Case 11: The API should return a validation error with a 400 status code - subSeries is missing.*****************"
-  );
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: ["ValidationError: subSeries is required and must be a string."],
-  });
-});
-
-it("Unit Test Case 12: The API should return a validation error (400) - startProdDate is missing.", async () => {
-  console.log(
-    "*****************Unit Test Case 12: The API should return a validation error with a 400 status code - startProdDate is missing.*****************"
-  );
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: startProdDate is required and must be a string in the format YYYY-MM-DD.",
-    ],
-  });
-});
-
-it("Unit Test Case 13: The API should return a validation error (400) - endProdDate is missing.", async () => {
-  console.log(
-    "*****************Unit Test Case 13: The API should return a validation error with a 400 status code - endProdDate is missing.*****************"
-  );
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: endProdDate is required and must be a string in the format YYYY-MM-DD.",
-    ],
-  });
-});
-
-it("Unit Test Case 14: The API should return a validation error (400) - startProdDate must be earlier than endProdDate.", async () => {
-  console.log(
-    "*****************Unit Test Case 14: The API should return a validation error with a 400 status code - startProdDate must be earlier than endProdDate.*****************"
-  );
-
-  process.env.VALIDATION = "nodata";
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2025-12-30",
-          endProdDate: "2025-01-01",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: For subseries RAV4, model year MY 25: startProdDate must be earlier than endProdDate.",
-      "ValidationError: For subseries RAV4, model year MY 25: endProdDate must be later than startProdDate.",
-    ],
-  });
-});
-
-
-it("Unit Test Case 15: The API should return a validation error (400) - startProdDate must be one day after previous model year endProdDate.", async () => {
-  console.log(
-    "*****************Unit Test Case 15: The API should return a validation error with a 400 status code - startProdDate must be one day after previous model year endProdDate.*****************"
-  );
-
-  process.env.VALIDATION = "nodata";
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2025-12-30",
-        },
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 26",
-          startProdDate: "2026-01-02", // should be 2025-12-31
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: For subseries RAV4, model year MY 26: startProdDate must be one day after previous model year endProdDate.",
-    ],
-  });
-});
-
-it("Unit Test Case 16: The API should return a validation error (400) - First model year start must be same or earlier than scenario start.", async () => {
-  console.log(
-    "*****************Unit Test Case 16: The API should return a validation error with a 400 status code - First model year start must be same or earlier than scenario start.*****************"
-  );
-
-  process.env.VALIDATION = "nodata";
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-07-01", // later than scenario start month (assumed 202406)
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: For subseries RAV4: First model year start must be same or earlier than scenario start.",
-    ],
-  });
-});
-
-
-it("Unit Test Case 17: The API should return a validation error (400) - Last model year start must be same or later than scenario end.", async () => {
-  console.log(
-    "*****************Unit Test Case 17: The API should return a validation error with a 400 status code - Last model year start must be same or later than scenario end.*****************"
-  );
-
-  process.env.VALIDATION = "nodata";
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-08-30", // earlier than scenario end month (assumed 202709)
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 400);
-
-  const response = JSON.parse(result.body);
-  assert.deepEqual(response, {
-    errorMessage: [
-      "ValidationError: For subseries RAV4: Last model year start must be same or later than scenario end.",
-    ],
-  });
-});
-
-it("Unit Test Case 18: The API should return internal server error with a 500 status code - DB error.", async () => {
-  console.log(
-    "*****************Unit Test Case 18: The API should return internal server error with a 500 status code - DB error.*****************"
-  );
-
-  process.env.VALIDATION = "dberror";
-
-  const event = {
-    body: JSON.stringify({
-      scenarioId: "a2940022-37f7-46ba-9fac-11fdb213914c",
-      userEmail: "gangone.priyadarshini@toyota.com",
-      data: [
-        {
-          subSeries: "RAV4",
-          modelYear: "MY 25",
-          startProdDate: "2024-06-01",
-          endProdDate: "2027-09-30",
-        },
-      ],
-    }),
-  };
-
-  const result = await lambda.handler(event);
-  assert.equal(result.statusCode, 500);
-
-  assert.deepEqual(JSON.parse(result.body).errorMessage, "Internal Server Error");
-});
-
+module.exports = {
+  validateInput,
+};
