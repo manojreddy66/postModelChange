@@ -11,12 +11,7 @@ const {
   getValidationSchema,
 } = require("schemaValidator/supplyPlanning/modelChangeDates/postModelChangeDatesSchema");
 
-const {
-  mergeModelChangeRows,
-  getModelYearNumber,
-  addDays,
-  toYYYYMM,
-} = require("utils/common_utils");
+const { getModelYearNumber, addDays, toYYYYMM } = require("utils/common_utils");
 
 /**
  * @description Function to validate input request body
@@ -79,7 +74,9 @@ async function checkForInvalidScenario(body, errorMessages) {
     /**
      * @description Get scenario data by scenarioId
      */
-    const scenarioData = await scenariosService.getScenarioDataById(body.scenarioId);
+    const scenarioData = await scenariosService.getScenarioDataById(
+      body.scenarioId
+    );
 
     /**
      * @description If scenario doesn't exist, add validation error and return null
@@ -156,7 +153,7 @@ async function validateModelChangeDatesRules(body, scenarioRow, errorMessages) {
       for (let i = 0; i < records.length; i++) {
         const record = records[i];
 
-        // lead suggested no UTC helper; assume YYYY-MM-DD comparisons are consistent in runtime
+        // lead suggested no UTC helper; assume YYYY-MM-DD comparisons are consistent
         const start = new Date(record.startProdDate);
         const end = new Date(record.endProdDate);
 
@@ -211,6 +208,28 @@ async function validateModelChangeDatesRules(body, scenarioRow, errorMessages) {
     console.log("Error in validateModelChangeDatesRules:", err);
     throw err;
   }
+}
+
+/**
+ * @description Merge existing DB rows and incoming request rows
+ * Incoming rows override DB rows for the same (subSeries + modelYear)
+ *
+ * @param {Array} existingRows - model change rows fetched from DB
+ * @param {Array} inputRows - model change rows sent by user in request body
+ * @returns {Array} merged final rows
+ */
+function mergeModelChangeRows(existingRows, inputRows) {
+  const map = new Map();
+
+  (existingRows || []).forEach((r) => {
+    map.set(`${r.subSeries}__${r.modelYear}`, r);
+  });
+
+  (inputRows || []).forEach((r) => {
+    map.set(`${r.subSeries}__${r.modelYear}`, r);
+  });
+
+  return Array.from(map.values());
 }
 
 module.exports = {
